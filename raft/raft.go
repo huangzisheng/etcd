@@ -657,6 +657,7 @@ func (r *raft) appendEntry(es ...pb.Entry) (accepted bool) {
 }
 
 // tickElection is run by followers and candidates after r.electionTimeout.
+// 超时触发选举
 func (r *raft) tickElection() {
 	r.electionElapsed++
 
@@ -791,6 +792,7 @@ func (r *raft) hup(t CampaignType) {
 
 // campaign transitions the raft instance to candidate state. This must only be
 // called after verifying that this is a legitimate transition.
+// 参与选举
 func (r *raft) campaign(t CampaignType) {
 	if !r.promotable() {
 		// This path should not be hit (callers are supposed to check), but
@@ -799,6 +801,7 @@ func (r *raft) campaign(t CampaignType) {
 	}
 	var term uint64
 	var voteMsg pb.MessageType
+	// 成为candidate，将任期id+1
 	if t == campaignPreElection {
 		r.becomePreCandidate()
 		voteMsg = pb.MsgPreVote
@@ -809,6 +812,7 @@ func (r *raft) campaign(t CampaignType) {
 		voteMsg = pb.MsgVote
 		term = r.Term
 	}
+	// 判断获取的票数是否超过半数，如果是则当选为leader
 	if _, _, res := r.poll(r.id, voteRespMsgType(voteMsg), true); res == quorum.VoteWon {
 		// We won the election after voting for ourselves (which must mean that
 		// this is a single-node cluster). Advance to the next state.
@@ -828,6 +832,7 @@ func (r *raft) campaign(t CampaignType) {
 		}
 		sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	}
+	// 向其他节点发送竞选消息
 	for _, id := range ids {
 		if id == r.id {
 			continue
@@ -853,12 +858,13 @@ func (r *raft) poll(id uint64, t pb.MessageType, v bool) (granted int, rejected 
 	return r.prs.TallyVotes()
 }
 
+//进入状态机
 func (r *raft) Step(m pb.Message) error {
 	// Handle the message term, which may result in our stepping down to a follower.
 	switch {
 	case m.Term == 0:
 		// local message
-	case m.Term > r.Term:
+	case m.Term > r.Term:	//消息中的任期大于本地的任期，开始新一轮的选举
 		if m.Type == pb.MsgVote || m.Type == pb.MsgPreVote {
 			force := bytes.Equal(m.Context, []byte(campaignTransfer))
 			inLease := r.checkQuorum && r.lead != None && r.electionElapsed < r.electionTimeout
@@ -928,7 +934,7 @@ func (r *raft) Step(m pb.Message) error {
 		return nil
 	}
 
-	switch m.Type {
+	switch m.Type {		//与本地最新的持久化日志比较
 	case pb.MsgHup:
 		if r.preVote {
 			r.hup(campaignPreElection)
@@ -936,7 +942,7 @@ func (r *raft) Step(m pb.Message) error {
 			r.hup(campaignElection)
 		}
 
-	case pb.MsgVote, pb.MsgPreVote:
+	case pb.MsgVote, pb.MsgPreVote:		//收到投票请求
 		// We can vote if this is a repeat of a vote we've already cast...
 		canVote := r.Vote == m.From ||
 			// ...we haven't voted and we don't think there's a leader yet in this term...
@@ -1138,8 +1144,10 @@ func stepLeader(r *raft, m pb.Message) error {
 			}
 		} else {
 			oldPaused := pr.IsPaused()
+			// 更新索引信息，更新该follower的match index和next index
 			if pr.MaybeUpdate(m.Index) {
 				switch {
+				// 日志追加成功，状态由复制探测状态变成复制状态，加快日志的追加
 				case pr.State == tracker.StateProbe:
 					pr.BecomeReplicate()
 				case pr.State == tracker.StateSnapshot && pr.Match >= pr.PendingSnapshot:
@@ -1157,12 +1165,14 @@ func stepLeader(r *raft, m pb.Message) error {
 				case pr.State == tracker.StateReplicate:
 					pr.Inflights.FreeLE(m.Index)
 				}
-
+				// leader进行本地状态的提交
 				if r.maybeCommit() {
+					// 广播至所有follower，通知进行log提交
 					r.bcastAppend()
 				} else if oldPaused {
 					// If we were paused before, this node may be missing the
 					// latest commit index, so send it.
+					// append请求被中止，则重新发送最新的请求
 					r.sendAppend(m.From)
 				}
 				// We've updated flow control information above, which may
@@ -1372,16 +1382,19 @@ func stepFollower(r *raft, m pb.Message) error {
 }
 
 func (r *raft) handleAppendEntries(m pb.Message) {
+	// leader提交的logindex小于本地已经提交的logindex
 	if m.Index < r.raftLog.committed {
 		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: r.raftLog.committed})
 		return
 	}
-
+	// 追加日志，可能存在冲突的情况，需要找到冲突的位置，用leader的日志进行覆盖
 	if mlastIndex, ok := r.raftLog.maybeAppend(m.Index, m.LogTerm, m.Commit, m.Entries...); ok {
+		// mlastIndex表示最佳成功的最新位置
 		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: mlastIndex})
 	} else {
 		r.logger.Debugf("%x [logterm: %d, index: %d] rejected MsgApp [logterm: %d, index: %d] from %x",
 			r.id, r.raftLog.zeroTermOnErrCompacted(r.raftLog.term(m.Index)), m.Index, m.LogTerm, m.Index, m.From)
+		// 任期信息不一致，拒绝此次追加请求，并把最新的logindex回复给leader，便于进行追加	
 		r.send(pb.Message{To: m.From, Type: pb.MsgAppResp, Index: m.Index, Reject: true, RejectHint: r.raftLog.lastIndex()})
 	}
 }
@@ -1584,6 +1597,7 @@ func (r *raft) loadState(state pb.HardState) {
 // pastElectionTimeout returns true iff r.electionElapsed is greater
 // than or equal to the randomized election timeout in
 // [electiontimeout, 2 * electiontimeout - 1].
+// 随机超时时间
 func (r *raft) pastElectionTimeout() bool {
 	return r.electionElapsed >= r.randomizedElectionTimeout
 }

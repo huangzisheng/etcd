@@ -126,11 +126,14 @@ func (rd Ready) appliedCursor() uint64 {
 type Node interface {
 	// Tick increments the internal logical clock for the Node by a single tick. Election
 	// timeouts and heartbeat timeouts are in units of ticks.
+	// 时钟的实现，选举超时和心跳超时基于此实现
 	Tick()
 	// Campaign causes the Node to transition to candidate state and start campaigning to become leader.
+	// 参与leader竞选
 	Campaign(ctx context.Context) error
 	// Propose proposes that data be appended to the log. Note that proposals can be lost without
 	// notice, therefore it is user's job to ensure proposal retries.
+	// 再日志中追加数据，需要实现方保证数据追加的成功
 	Propose(ctx context.Context, data []byte) error
 	// ProposeConfChange proposes a configuration change. Like any proposal, the
 	// configuration change may be dropped with or without an error being
@@ -144,9 +147,11 @@ type Node interface {
 	// message is only allowed if all Nodes participating in the cluster run a
 	// version of this library aware of the V2 API. See pb.ConfChangeV2 for
 	// usage details and semantics.
+	//集群配置变更
 	ProposeConfChange(ctx context.Context, cc pb.ConfChangeI) error
 
 	// Step advances the state machine using the given message. ctx.Err() will be returned, if any.
+	// 根据消息改变状态机的状态
 	Step(ctx context.Context, msg pb.Message) error
 
 	// Ready returns a channel that returns the current point-in-time state.
@@ -154,6 +159,7 @@ type Node interface {
 	//
 	// NOTE: No committed entries from the next Ready may be applied until all committed entries
 	// and snapshots from the previous one have finished.
+	// 标志某一状态的完成，收到状态变化的节点必须提交变更
 	Ready() <-chan Ready
 
 	// Advance notifies the Node that the application has saved progress up to the last Ready.
@@ -165,6 +171,7 @@ type Node interface {
 	// commands. For example. when the last Ready contains a snapshot, the application might take
 	// a long time to apply the snapshot data. To continue receiving Ready without blocking raft
 	// progress, it can call Advance before finishing applying the last ready.
+	// 进行状态的提交
 	Advance()
 	// ApplyConfChange applies a config change (previously passed to
 	// ProposeConfChange) to the node. This must be called whenever a config
@@ -174,20 +181,25 @@ type Node interface {
 	//
 	// Returns an opaque non-nil ConfState protobuf which must be recorded in
 	// snapshots.
+	// 进行集群状态变更
 	ApplyConfChange(cc pb.ConfChangeI) *pb.ConfState
 
 	// TransferLeadership attempts to transfer leadership to the given transferee.
+	// 变更leader
 	TransferLeadership(ctx context.Context, lead, transferee uint64)
 
 	// ReadIndex request a read state. The read state will be set in the ready.
 	// Read state has a read index. Once the application advances further than the read
 	// index, any linearizable read requests issued before the read request can be
 	// processed safely. The read state will have the same rctx attached.
+	// 保证线性一致性的读
 	ReadIndex(ctx context.Context, rctx []byte) error
 
 	// Status returns the current status of the raft state machine.
+	// 状态机当前的配置
 	Status() Status
 	// ReportUnreachable reports the given node is not reachable for the last send.
+	// 上报节点不可达
 	ReportUnreachable(id uint64)
 	// ReportSnapshot reports the status of the sent snapshot. The id is the raft ID of the follower
 	// who is meant to receive the snapshot, and the status is SnapshotFinish or SnapshotFailure.
@@ -199,8 +211,10 @@ type Node interface {
 	// updates from the leader. Therefore, it is crucial that the application ensures that any
 	// failure in snapshot sending is caught and reported back to the leader; so it can resume raft
 	// log probing in the follower.
+	// 上报快照状态
 	ReportSnapshot(id uint64, status SnapshotStatus)
 	// Stop performs any necessary termination of the Node.
+	// 停止节点
 	Stop()
 }
 
@@ -340,20 +354,20 @@ func (n *node) run() {
 		// TODO: maybe buffer the config propose if there exists one (the way
 		// described in raft dissertation)
 		// Currently it is dropped in Step silently.
-		case pm := <-propc:
+		case pm := <-propc:	//从 channel propc 读取数据
 			m := pm.m
 			m.From = r.id
-			err := r.Step(m)
+			err := r.Step(m)	//进入状态机
 			if pm.result != nil {
 				pm.result <- err
 				close(pm.result)
 			}
-		case m := <-n.recvc:
+		case m := <-n.recvc:	//接收到readindex请求
 			// filter out response message from unknown From.
 			if pr := r.prs.Progress[m.From]; pr != nil || !IsResponseMsg(m.Type) {
 				r.Step(m)
 			}
-		case cc := <-n.confc:
+		case cc := <-n.confc:	//配置变更
 			_, okBefore := r.prs.Progress[r.id]
 			cs := r.applyConfChange(cc)
 			// If the node was removed, block incoming proposals. Note that we
@@ -384,18 +398,18 @@ func (n *node) run() {
 			case n.confstatec <- cs:
 			case <-n.done:
 			}
-		case <-n.tickc:
-			n.rn.Tick()
-		case readyc <- rd:
+		case <-n.tickc:			// 超时时间到，包括选举超时和心跳超时
+			n.rn.Tick()			// 回调函数 tickElection 触发选举 tickHeartbeat 触发发送心跳
+		case readyc <- rd:		// 数据ready
 			n.rn.acceptReady(rd)
 			advancec = n.advancec
-		case <-advancec:
+		case <-advancec:		// 可以进行状态变更和日志提交
 			n.rn.Advance(rd)
 			rd = Ready{}
 			advancec = nil
-		case c := <-n.status:
+		case c := <-n.status:	// 节点状态信号
 			c <- getStatus(r)
-		case <-n.stop:
+		case <-n.stop:			// 收到停止信号
 			close(n.done)
 			return
 		}
@@ -454,6 +468,7 @@ func (n *node) stepWait(ctx context.Context, m pb.Message) error {
 
 // Step advances the state machine using msgs. The ctx.Err() will be returned,
 // if any.
+// 日志消息传递
 func (n *node) stepWithWaitOption(ctx context.Context, m pb.Message, wait bool) error {
 	if m.Type != pb.MsgProp {
 		select {
@@ -470,9 +485,11 @@ func (n *node) stepWithWaitOption(ctx context.Context, m pb.Message, wait bool) 
 	if wait {
 		pm.result = make(chan error, 1)
 	}
+	// 提交日志数据至node的propc channel队列
 	select {
 	case ch <- pm:
 		if !wait {
+			// 非阻塞直接返回
 			return nil
 		}
 	case <-ctx.Done():
@@ -480,6 +497,7 @@ func (n *node) stepWithWaitOption(ctx context.Context, m pb.Message, wait bool) 
 	case <-n.done:
 		return ErrStopped
 	}
+	// 等待结果返回
 	select {
 	case err := <-pm.result:
 		if err != nil {
