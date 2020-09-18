@@ -315,7 +315,7 @@ type raft struct {
 	disableProposalForwarding bool
 
 	tick func()
-	step stepFunc
+	step stepFunc	// 回调函数
 
 	logger Logger
 }
@@ -993,7 +993,7 @@ func (r *raft) Step(m pb.Message) error {
 		}
 
 	default:
-		err := r.step(r, m)
+		err := r.step(r, m)		//回调函数，在不同state会设置不同的回调函数来驱动raft
 		if err != nil {
 			return err
 		}
@@ -1696,3 +1696,17 @@ func numOfPendingConf(ents []pb.Entry) int {
 	}
 	return n
 }
+
+// 状态转换
+/*
+
+  becomeFollower               becomeFollower
+-----------------> Follower <---------------------- Leader
+                        |							   /|\ 
+						|								|
+	 becomePreCandidate |								| becomeLeader
+						|								|
+					   \|/       becomeCandidate	    |
+				  PreCandidate ------------------> Candidate	
+
+*/
