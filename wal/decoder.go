@@ -53,7 +53,7 @@ func newDecoder(r ...io.Reader) *decoder {
 }
 
 func (d *decoder) decode(rec *walpb.Record) error {
-	rec.Reset()
+	rec.Reset()	//先重置为空???
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	return d.decodeRecord(rec)
@@ -64,12 +64,13 @@ func (d *decoder) decode(rec *walpb.Record) error {
 // thus entry size should never exceed 10 MB
 const maxWALEntrySizeLimit = int64(10 * 1024 * 1024)
 
+//主要函数
 func (d *decoder) decodeRecord(rec *walpb.Record) error {
 	if len(d.brs) == 0 {
 		return io.EOF
 	}
 
-	l, err := readInt64(d.brs[0])
+	l, err := readInt64(d.brs[0])	//l表示的是什么？
 	if err == io.EOF || (err == nil && l == 0) {
 		// hit end of file or preallocated space
 		d.brs = d.brs[1:]
@@ -88,6 +89,7 @@ func (d *decoder) decodeRecord(rec *walpb.Record) error {
 		return ErrMaxWALEntrySizeLimitExceeded
 	}
 
+	//读取内容到data
 	data := make([]byte, recBytes+padBytes)
 	if _, err = io.ReadFull(d.brs[0], data); err != nil {
 		// ReadFull returns io.EOF only if no bytes were read
@@ -97,6 +99,7 @@ func (d *decoder) decodeRecord(rec *walpb.Record) error {
 		}
 		return err
 	}
+	//反序列化到rec?
 	if err := rec.Unmarshal(data[:recBytes]); err != nil {
 		if d.isTornEntry(data) {
 			return io.ErrUnexpectedEOF
@@ -119,6 +122,7 @@ func (d *decoder) decodeRecord(rec *walpb.Record) error {
 	return nil
 }
 
+//记录的大小以及？
 func decodeFrameSize(lenField int64) (recBytes int64, padBytes int64) {
 	// the record size is stored in the lower 56 bits of the 64-bit length
 	recBytes = int64(uint64(lenField) & ^(uint64(0xff) << 56))
@@ -167,6 +171,7 @@ func (d *decoder) isTornEntry(data []byte) bool {
 	return false
 }
 
+//更新crc校验码
 func (d *decoder) updateCRC(prevCrc uint32) {
 	d.crc = crc.New(prevCrc, crcTable)
 }
@@ -175,20 +180,24 @@ func (d *decoder) lastCRC() uint32 {
 	return d.crc.Sum32()
 }
 
+//返回最后有效的解码记录之后的文件偏移
 func (d *decoder) lastOffset() int64 { return d.lastValidOff }
 
+//讲字节数据d反序列化到一个Entry中
 func mustUnmarshalEntry(d []byte) raftpb.Entry {
 	var e raftpb.Entry
 	pbutil.MustUnmarshal(&e, d)
 	return e
 }
 
+//讲字节数据d反序列化到一个HardState变量中
 func mustUnmarshalState(d []byte) raftpb.HardState {
 	var s raftpb.HardState
 	pbutil.MustUnmarshal(&s, d)
 	return s
 }
 
+//从r中以小端方式读取字节数据并反序列化为int64类型
 func readInt64(r io.Reader) (int64, error) {
 	var n int64
 	err := binary.Read(r, binary.LittleEndian, &n)
