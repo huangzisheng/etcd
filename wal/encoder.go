@@ -50,6 +50,7 @@ func newEncoder(w io.Writer, prevCrc uint32, pageOffset int) *encoder {
 	}
 }
 
+//在当前文件的偏移量之后创建encoder
 // newFileEncoder creates a new encoder with current file offset for the page writer.
 func newFileEncoder(f *os.File, prevCrc uint32) (*encoder, error) {
 	offset, err := f.Seek(0, io.SeekCurrent)
@@ -59,30 +60,33 @@ func newFileEncoder(f *os.File, prevCrc uint32) (*encoder, error) {
 	return newEncoder(f, prevCrc, int(offset)), nil
 }
 
+//encode实际上就是将记录写入文件
 func (e *encoder) encode(rec *walpb.Record) error {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	e.crc.Write(rec.Data)
-	rec.Crc = e.crc.Sum32()
+	e.crc.Write(rec.Data)	//向hash中写入数据，为啥这样做？
+	rec.Crc = e.crc.Sum32() //计算hash值
 	var (
 		data []byte
 		err  error
 		n    int
 	)
 
+	//如果记录的大小比encoder的缓冲区容量大，则直接对记录rec进行序列化
 	if rec.Size() > len(e.buf) {
 		data, err = rec.Marshal()
 		if err != nil {
 			return err
 		}
-	} else {
+	} else {	//否则将rec序列化到encoder的缓冲区里再截取
 		n, err = rec.MarshalTo(e.buf)
 		if err != nil {
 			return err
 		}
 		data = e.buf[:n]
 	}
+	//为什么要分这两种情况，encoder的缓冲区buf是不是有点多余？直接序列化就行？
 
 	lenField, padBytes := encodeFrameSize(len(data))
 	if err = writeUint64(e.bw, lenField, e.uint64buf); err != nil {
@@ -92,14 +96,14 @@ func (e *encoder) encode(rec *walpb.Record) error {
 	if padBytes != 0 {
 		data = append(data, make([]byte, padBytes)...)
 	}
-	n, err = e.bw.Write(data)
+	n, err = e.bw.Write(data)	//将序列化后的数据写入文件
 	walWriteBytes.Add(float64(n))
 	return err
 }
 
 func encodeFrameSize(dataBytes int) (lenField uint64, padBytes int) {
 	lenField = uint64(dataBytes)
-	// force 8 byte alignment so length never gets a torn write
+	// force 8 byte alignment so length never gets a torn write		//8位对齐？
 	padBytes = (8 - (dataBytes % 8)) % 8
 	if padBytes != 0 {
 		lenField |= uint64(0x80|padBytes) << 56
@@ -107,6 +111,7 @@ func encodeFrameSize(dataBytes int) (lenField uint64, padBytes int) {
 	return lenField, padBytes
 }
 
+//将缓冲区中的内容刷新到文件中？
 func (e *encoder) flush() error {
 	e.mu.Lock()
 	n, err := e.bw.FlushN()
@@ -117,8 +122,8 @@ func (e *encoder) flush() error {
 
 func writeUint64(w io.Writer, n uint64, buf []byte) error {
 	// http://golang.org/src/encoding/binary/binary.go
-	binary.LittleEndian.PutUint64(buf, n)
-	nv, err := w.Write(buf)
+	binary.LittleEndian.PutUint64(buf, n)	//以小端方式放入字节数据切片中
+	nv, err := w.Write(buf)					//将字节数据写入
 	walWriteBytes.Add(float64(nv))
 	return err
 }
