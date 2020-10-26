@@ -18,3 +18,8 @@ message Snapshot {
 	optional uint64 index = 1 [(gogoproto.nullable) = false];
 	optional uint64 term  = 2 [(gogoproto.nullable) = false];
 }
+
+//wal的protobuf文件，为什么不用proto3？
+//主要有两个结构Record和Snapshot
+//前者记录每个信息的类型和内容，以及crc校验码
+//后者用任期term和索引index指出快照的位置？
